@@ -3,11 +3,14 @@ import logging
 import os
 from datetime import datetime, timezone
 from urllib.parse import urlencode, urlparse
+from uuid import uuid4
 
 import requests
 from django.http import JsonResponse
 from django.shortcuts import redirect
 from django.views.decorators.csrf import csrf_exempt
+
+from .models import CustomModel
 
 QQ_AUTHORIZE_URL = 'https://graph.qq.com/oauth2.0/authorize'
 QQ_ACCESS_TOKEN_URL = 'https://graph.qq.com/oauth2.0/token'
@@ -21,10 +24,12 @@ VISITOR_COOKIE_SECURE = os.environ.get('VISITOR_AUTH_COOKIE_SECURE', 'true').low
 VISITOR_COOKIE_DOMAIN = os.environ.get('VISITOR_AUTH_COOKIE_DOMAIN') or None
 VISITOR_COOKIE_PATH = os.environ.get('VISITOR_AUTH_COOKIE_PATH', '/')
 
+CHECKIN_PREFIX = 'visitor-checkin:'
+WISH_PREFIX = 'visitor-wish:'
+
 
 def _json_error(message: str, status_code: int = 400):
     return JsonResponse({'status': False, 'error': message}, status=status_code)
-
 
 
 def _get_required_env(name: str) -> str:
@@ -34,13 +39,11 @@ def _get_required_env(name: str) -> str:
     return value
 
 
-
 def _build_callback_url(request) -> str:
     configured = os.environ.get('QQ_REDIRECT_URI', '').strip()
     if configured:
         return configured
     return request.build_absolute_uri('/auth/qq/callback/')
-
 
 
 def _sanitize_return_to(value: str, fallback: str) -> str:
@@ -57,7 +60,6 @@ def _sanitize_return_to(value: str, fallback: str) -> str:
     return fallback
 
 
-
 def _build_result_url(target: str, status: str, reason: str | None = None) -> str:
     separator = '&' if '?' in target else '?'
     suffix = f'visitor_login={status}'
@@ -66,10 +68,8 @@ def _build_result_url(target: str, status: str, reason: str | None = None) -> st
     return f'{target}{separator}{suffix}'
 
 
-
 def _get_login_success_url() -> str:
     return os.environ.get('VISITOR_LOGIN_SUCCESS_URL', '/').strip() or '/'
-
 
 
 def _load_access_token(payload: str) -> str:
@@ -82,7 +82,6 @@ def _load_access_token(payload: str) -> str:
     if not token:
         raise ValueError(body)
     return token
-
 
 
 def _get_qq_user_profile(access_token: str) -> dict:
@@ -127,6 +126,105 @@ def _get_qq_user_profile(access_token: str) -> dict:
     }
 
 
+def _get_cookie_visitor(request):
+    try:
+        payload = request.get_signed_cookie(VISITOR_COOKIE_NAME, salt='visitor-auth')
+        return json.loads(payload)
+    except Exception:
+        return None
+
+
+def _public_visitor_profile(visitor: dict | None):
+    if not visitor:
+        return None
+
+    return {
+        'provider': visitor.get('provider', 'qq'),
+        'openid': visitor.get('openid', ''),
+        'nickname': visitor.get('nickname') or 'QQ 用户',
+        'avatar': visitor.get('avatar') or '',
+        'province': visitor.get('province') or '',
+        'city': visitor.get('city') or '',
+    }
+
+
+def _normalize_message(value: str, fallback: str, limit: int = 120) -> str:
+    text = (value or '').strip()
+    if not text:
+        return fallback
+    return text[:limit]
+
+
+def _load_custom_payload(record):
+    try:
+        return json.loads(record.content)
+    except Exception:
+        return None
+
+
+def _get_today_string() -> str:
+    return datetime.now().strftime('%Y-%m-%d')
+
+
+def _get_recent_visitors(limit: int = 8):
+    records = []
+    for item in CustomModel.objects.filter(name__startswith=CHECKIN_PREFIX):
+        payload = _load_custom_payload(item)
+        if payload:
+            records.append(payload)
+
+    records.sort(key=lambda item: item.get('updated_at', ''), reverse=True)
+    return records[:limit]
+
+
+def _get_today_checkin(visitor: dict | None):
+    if not visitor:
+        return None
+
+    name = f'{CHECKIN_PREFIX}{_get_today_string()}:{visitor.get("openid", "")}'
+    record = CustomModel.objects.get_by_name_or_none(name)
+    return _load_custom_payload(record) if record else None
+
+
+def _get_wish_groups(limit: int = 12):
+    grouped = {}
+
+    for item in CustomModel.objects.filter(name__startswith=WISH_PREFIX):
+        payload = _load_custom_payload(item)
+        if not payload:
+            continue
+
+        visitor = payload.get('visitor') or {}
+        openid = visitor.get('openid')
+        if not openid:
+            continue
+
+        group = grouped.setdefault(openid, {
+            'visitor': visitor,
+            'count': 0,
+            'latest_at': '',
+            'latest_message': '',
+            'items': [],
+        })
+        group['count'] += 1
+        group['items'].append({
+            'id': payload.get('id', ''),
+            'message': payload.get('message', ''),
+            'created_at': payload.get('created_at', ''),
+        })
+
+    result = []
+    for group in grouped.values():
+        group['items'].sort(key=lambda item: item.get('created_at', ''), reverse=True)
+        latest = group['items'][0] if group['items'] else {'created_at': '', 'message': ''}
+        group['latest_at'] = latest.get('created_at', '')
+        group['latest_message'] = latest.get('message', '')
+        group['items'] = group['items'][:3]
+        result.append(group)
+
+    result.sort(key=lambda item: item.get('latest_at', ''), reverse=True)
+    return result[:limit]
+
 
 def qq_login_start(request):
     try:
@@ -151,7 +249,6 @@ def qq_login_start(request):
         'scope': 'get_user_info',
     })
     return redirect(f'{QQ_AUTHORIZE_URL}?{params}')
-
 
 
 def qq_login_callback(request):
@@ -205,20 +302,103 @@ def qq_login_callback(request):
     return response
 
 
-
 def visitor_me(request):
-    try:
-        payload = request.get_signed_cookie(VISITOR_COOKIE_NAME, salt='visitor-auth')
-    except Exception:
-        return JsonResponse({'status': True, 'authenticated': False, 'user': None})
-
-    try:
-        user = json.loads(payload)
-    except json.JSONDecodeError:
+    user = _get_cookie_visitor(request)
+    if not user:
         return JsonResponse({'status': True, 'authenticated': False, 'user': None})
 
     return JsonResponse({'status': True, 'authenticated': True, 'user': user})
 
+
+def visitor_summary(request):
+    visitor = _get_cookie_visitor(request)
+    return JsonResponse({
+        'status': True,
+        'authenticated': bool(visitor),
+        'user': _public_visitor_profile(visitor),
+        'todayCheckin': _get_today_checkin(visitor),
+        'recentVisitors': _get_recent_visitors(),
+        'wishGroups': _get_wish_groups(),
+    })
+
+
+@csrf_exempt
+def visitor_checkin(request):
+    if request.method != 'POST':
+        return _json_error('Method not allowed', 405)
+
+    visitor = _get_cookie_visitor(request)
+    if not visitor:
+        return _json_error('QQ login required', 401)
+
+    try:
+        data = json.loads(request.body.decode('utf-8') or '{}')
+    except Exception:
+        data = {}
+
+    now = datetime.now(timezone.utc).isoformat()
+    day = _get_today_string()
+    message = _normalize_message(data.get('message', ''), '今天来过', 80)
+    visitor_profile = _public_visitor_profile(visitor)
+    name = f'{CHECKIN_PREFIX}{day}:{visitor_profile["openid"]}'
+    payload = {
+        'visitor': visitor_profile,
+        'message': message,
+        'day': day,
+        'updated_at': now,
+    }
+
+    record = CustomModel.objects.get_by_name_or_none(name)
+    if record:
+        record.content = json.dumps(payload, ensure_ascii=False)
+    else:
+        record = CustomModel(name=name, content=json.dumps(payload, ensure_ascii=False))
+    record.save()
+
+    return JsonResponse({
+        'status': True,
+        'entry': payload,
+        'recentVisitors': _get_recent_visitors(),
+    })
+
+
+@csrf_exempt
+def visitor_wish_submit(request):
+    if request.method != 'POST':
+        return _json_error('Method not allowed', 405)
+
+    visitor = _get_cookie_visitor(request)
+    if not visitor:
+        return _json_error('QQ login required', 401)
+
+    try:
+        data = json.loads(request.body.decode('utf-8') or '{}')
+    except Exception:
+        data = {}
+
+    message = _normalize_message(data.get('message', ''), '', 120)
+    if not message:
+        return _json_error('Wish message is required', 400)
+
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        'id': uuid4().hex,
+        'visitor': _public_visitor_profile(visitor),
+        'message': message,
+        'created_at': now,
+    }
+
+    record = CustomModel(
+        name=f'{WISH_PREFIX}{now}:{payload["id"]}',
+        content=json.dumps(payload, ensure_ascii=False),
+    )
+    record.save()
+
+    return JsonResponse({
+        'status': True,
+        'wish': payload,
+        'wishGroups': _get_wish_groups(),
+    })
 
 
 @csrf_exempt
