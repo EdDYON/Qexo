@@ -4,7 +4,7 @@ from django.urls import path, re_path, include
 from django.views.static import serve
 import hexoweb.pub as pub
 from django.views.generic import TemplateView
-from hexoweb.visitor_auth import qq_login_start, qq_login_callback, visitor_me, visitor_logout, visitor_summary, visitor_checkin, visitor_wish_submit
+from hexoweb.visitor_auth import qq_login_start, qq_login_callback, visitor_me, visitor_logout, visitor_summary, visitor_checkin, visitor_wish_submit, visitor_wish_delete
 
 urlpatterns = [
     # path('admin/', admin.site.urls),
@@ -29,6 +29,7 @@ urlpatterns = [
     path('pub/visitor/summary/', visitor_summary, name='pub_visitor_summary'),
     path('pub/visitor/checkin/', visitor_checkin, name='pub_visitor_checkin'),
     path('pub/visitor/wish/', visitor_wish_submit, name='pub_visitor_wish'),
+    path('pub/visitor/wish/delete/', visitor_wish_delete, name='pub_visitor_wish_delete'),
     path('pub/visitor/logout/', visitor_logout, name='pub_visitor_logout'),
     path('api/auth/', auth, name='auth'),
     path('api/init_step/', init_step_api, name='init_step_api'),
@@ -117,5 +118,6 @@ urlpatterns = [
 handler404 = page_404
 handler500 = page_500
 handler403 = page_403
+
 
 

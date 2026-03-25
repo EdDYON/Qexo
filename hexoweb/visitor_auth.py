@@ -226,6 +226,22 @@ def _get_wish_groups(limit: int = 12):
     return result[:limit]
 
 
+def _find_wish_record(openid: str, wish_id: str):
+    if not openid or not wish_id:
+        return None, None
+
+    for item in CustomModel.objects.filter(name__startswith=WISH_PREFIX):
+        payload = _load_custom_payload(item)
+        if not payload:
+            continue
+
+        visitor = payload.get('visitor') or {}
+        if visitor.get('openid') == openid and payload.get('id') == wish_id:
+            return item, payload
+
+    return None, None
+
+
 def qq_login_start(request):
     try:
         app_id = _get_required_env('QQ_APP_ID')
@@ -324,12 +340,27 @@ def visitor_summary(request):
 
 @csrf_exempt
 def visitor_checkin(request):
-    if request.method != 'POST':
+    if request.method not in {'POST', 'DELETE'}:
         return _json_error('Method not allowed', 405)
 
     visitor = _get_cookie_visitor(request)
     if not visitor:
         return _json_error('QQ login required', 401)
+
+    visitor_profile = _public_visitor_profile(visitor)
+    day = _get_today_string()
+    name = f'{CHECKIN_PREFIX}{day}:{visitor_profile["openid"]}'
+
+    if request.method == 'DELETE':
+        record = CustomModel.objects.get_by_name_or_none(name)
+        if record:
+            record.delete()
+
+        return JsonResponse({
+            'status': True,
+            'todayCheckin': None,
+            'recentVisitors': _get_recent_visitors(),
+        })
 
     try:
         data = json.loads(request.body.decode('utf-8') or '{}')
@@ -337,10 +368,7 @@ def visitor_checkin(request):
         data = {}
 
     now = datetime.now(timezone.utc).isoformat()
-    day = _get_today_string()
     message = _normalize_message(data.get('message', ''), '今天来过', 80)
-    visitor_profile = _public_visitor_profile(visitor)
-    name = f'{CHECKIN_PREFIX}{day}:{visitor_profile["openid"]}'
     payload = {
         'visitor': visitor_profile,
         'message': message,
@@ -397,6 +425,34 @@ def visitor_wish_submit(request):
     return JsonResponse({
         'status': True,
         'wish': payload,
+        'wishGroups': _get_wish_groups(),
+    })
+
+
+@csrf_exempt
+def visitor_wish_delete(request):
+    if request.method != 'POST':
+        return _json_error('Method not allowed', 405)
+
+    visitor = _get_cookie_visitor(request)
+    if not visitor:
+        return _json_error('QQ login required', 401)
+
+    try:
+        data = json.loads(request.body.decode('utf-8') or '{}')
+    except Exception:
+        data = {}
+
+    wish_id = (data.get('id') or '').strip()
+    record, payload = _find_wish_record(visitor.get('openid', ''), wish_id)
+    if not record or not payload:
+        return _json_error('Wish not found', 404)
+
+    record.delete()
+
+    return JsonResponse({
+        'status': True,
+        'deletedId': wish_id,
         'wishGroups': _get_wish_groups(),
     })
 
