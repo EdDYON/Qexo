@@ -1,0 +1,12 @@
+.vercel
+*.py[cod]
+.idea
+tmp
+venv
+configs.py
+*.sqlite3
+*.db
+.env
+.vscode
+__pycache__/
+docker-compose.yaml
